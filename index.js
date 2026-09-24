@@ -112,22 +112,94 @@ function question(message) {
 }
 
 /* ============================================================
-   AUTO RESTART
+   HOT-RELOAD DE COMANDOS (SEM REINICIAR O BOT INTEIRO)
+============================================================ */
+const commands = new Map();
+
+function normalizeCommandName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^[!/#.$%]+/, "")
+    .split(/\s+/)[0];
+}
+
+function readCommandsFromDir(dirPath) {
+  if (!fs.existsSync(dirPath)) return;
+  let items;
+  try {
+    items = fs.readdirSync(dirPath);
+  } catch (err) {
+    error(`Erro ao ler comandos em ${dirPath}: ${err.message}`);
+    return;
+  }
+  for (const item of items) {
+    const fullPath = path.join(dirPath, item);
+    let stat;
+    try { stat = fs.statSync(fullPath); } catch { continue; }
+    if (stat.isDirectory()) {
+      readCommandsFromDir(fullPath);
+      continue;
+    }
+    if (!item.endsWith(".js")) continue;
+    try {
+      delete require.cache[require.resolve(fullPath)];
+      const mod = require(fullPath);
+      const baseName = path.basename(item, ".js").toLowerCase();
+      const commandNames = new Set([baseName]);
+      if (mod && typeof mod === "object") {
+        if (mod.name) commandNames.add(String(mod.name).toLowerCase());
+        if (Array.isArray(mod.commands)) mod.commands.forEach(c => commandNames.add(String(c).toLowerCase()));
+        if (Array.isArray(mod.aliases)) mod.aliases.forEach(a => commandNames.add(String(a).toLowerCase()));
+        if (Array.isArray(mod.prefixes)) mod.prefixes.forEach(p => commandNames.add(String(p).toLowerCase()));
+      }
+      for (const name of commandNames) {
+        const normalized = normalizeCommandName(name);
+        if (normalized && !commands.has(normalized)) {
+          commands.set(normalized, mod);
+        }
+      }
+    } catch (err) {
+      error(`Falha ao carregar ${item}: ${err.stack || err.message}`);
+    }
+  }
+}
+
+function loadCommands() {
+  commands.clear();
+  const targetDirs = CMD_DIRS.length ? CMD_DIRS : [CMD_DIR];
+  for (const dir of targetDirs) readCommandsFromDir(dir);
+  info(`Total de comandos recarregados/mapeados: ${commands.size}`);
+}
+
+function findCommand(text) {
+  const clean = String(text || "").trim();
+  const firstWord = normalizeCommandName(clean);
+  if (!firstWord) return null;
+  const command = commands.get(firstWord);
+  if (!command) return null;
+  return { name: firstWord, command };
+}
+
+/* ============================================================
+   AUTO RESTART APENAS PARA ARQUIVOS RAIZ / SISTEMA
 ============================================================ */
 const AUTO_RESTART = {
   enabled: true,
-  interval: 1500,
+  interval: 2000,
   debounce: 2000,
   restarting: false,
   timer: null,
   snapshot: new Map(),
   watcherStarted: false
 };
+
 const RESTART_IGNORE = [
   "node_modules",
   ".git",
-  path.join("assets", "database", "baileys"),
-  path.join("assets", "temp")
+  path.join("assets"),
+  path.join("src", "command"),
+  path.join("src", "commands")
 ];
 
 function isIgnoredPath(filePath) {
@@ -193,10 +265,10 @@ function restartSystem(reason) {
   AUTO_RESTART.restarting = true;
   if (AUTO_RESTART.timer) clearTimeout(AUTO_RESTART.timer);
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  info(`Auto-Restart disparado. Motivo: ${reason}`);
+  info(`Auto-Restart de sistema disparado. Motivo: ${reason}`);
   try {
     if (activeSocket && typeof activeSocket.end === "function") {
-      activeSocket.end(new Error("AMHEEX_AUTO_RESTART"));
+      activeSocket.end(undefined);
     }
   } catch (err) {
     warning(`Erro fechando socket no restart: ${err.message}`);
@@ -221,7 +293,21 @@ function restartSystem(reason) {
 function startBaseDirWatcher() {
   if (!AUTO_RESTART.enabled || AUTO_RESTART.watcherStarted) return;
   AUTO_RESTART.watcherStarted = true;
-  info("Watcher do diretório ativo.");
+  info("Watcher do sistema e atualização rápida de comandos ativos.");
+  
+  // Watcher dos comandos para Hot-Reload
+  const targetDirs = CMD_DIRS.length ? CMD_DIRS : [CMD_DIR];
+  for (const cDir of targetDirs) {
+    try {
+      fs.watch(cDir, { recursive: true }, (eventType, filename) => {
+        if (filename && filename.endsWith(".js")) {
+          info(`Alteração detectada no comando "${filename}". Atualizando comandos sem reiniciar o bot...`);
+          loadCommands();
+        }
+      });
+    } catch (e) {}
+  }
+
   AUTO_RESTART.snapshot = getFileSnapshot();
   setInterval(() => {
     if (AUTO_RESTART.restarting) return;
@@ -316,7 +402,6 @@ function extractMessageDetails(webMessage) {
     let text = "";
     let data = {};
 
-    // Suporte para mensagens interativas (Botões e Respostas)
     const interactiveMsg = message?.interactiveResponseMessage || message?.viewOnceMessage?.message?.interactiveResponseMessage;
     if (interactiveMsg?.nativeFlowResponseMessage?.paramsJson) {
       try {
@@ -380,77 +465,6 @@ function getChatType(remoteJid) {
 }
 
 /* ============================================================
-   GERENCIAMENTO DE COMANDOS
-============================================================ */
-const commands = new Map();
-
-function normalizeCommandName(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/^[!/#.$%]+/, "")
-    .split(/\s+/)[0];
-}
-
-function readCommandsFromDir(dirPath) {
-  if (!fs.existsSync(dirPath)) return;
-  let items;
-  try {
-    items = fs.readdirSync(dirPath);
-  } catch (err) {
-    error(`Erro ao ler comandos em ${dirPath}: ${err.message}`);
-    return;
-  }
-  for (const item of items) {
-    const fullPath = path.join(dirPath, item);
-    let stat;
-    try { stat = fs.statSync(fullPath); } catch { continue; }
-    if (stat.isDirectory()) {
-      readCommandsFromDir(fullPath);
-      continue;
-    }
-    if (!item.endsWith(".js")) continue;
-    try {
-      delete require.cache[require.resolve(fullPath)];
-      const mod = require(fullPath);
-      const baseName = path.basename(item, ".js").toLowerCase();
-      const commandNames = new Set([baseName]);
-      if (mod && typeof mod === "object") {
-        if (mod.name) commandNames.add(String(mod.name).toLowerCase());
-        if (Array.isArray(mod.commands)) mod.commands.forEach(c => commandNames.add(String(c).toLowerCase()));
-        if (Array.isArray(mod.aliases)) mod.aliases.forEach(a => commandNames.add(String(a).toLowerCase()));
-        if (Array.isArray(mod.prefixes)) mod.prefixes.forEach(p => commandNames.add(String(p).toLowerCase()));
-      }
-      for (const name of commandNames) {
-        const normalized = normalizeCommandName(name);
-        if (normalized && !commands.has(normalized)) {
-          commands.set(normalized, mod);
-        }
-      }
-      info(`Carregado: ${path.relative(BASE_DIR, fullPath)}`);
-    } catch (err) {
-      error(`Falha ao carregar ${item}: ${err.stack || err.message}`);
-    }
-  }
-}
-
-function loadCommands() {
-  commands.clear();
-  const targetDirs = CMD_DIRS.length ? CMD_DIRS : [CMD_DIR];
-  for (const dir of targetDirs) readCommandsFromDir(dir);
-  info(`Total de comandos mapeados: ${commands.size}`);
-}
-
-function findCommand(text) {
-  const clean = String(text || "").trim();
-  const firstWord = normalizeCommandName(clean);
-  if (!firstWord) return null;
-  const command = commands.get(firstWord);
-  if (!command) return null;
-  return { name: firstWord, command };
-}
-
-/* ============================================================
    FUNÇÕES DE ENVIO E INTERAÇÕES
 ============================================================ */
 async function sendText(socket, jid, text, quoted) {
@@ -489,7 +503,6 @@ function createCommandContext(socket, webMessage, text, commandName) {
     sendReply: value => sendText(socket, jid, value, webMessage)
   };
 
-  // Injeta no próprio m/webMessage os utilitários de resposta caso o comando chame `m.sendReply(...)` ou `webMessage.reply(...)`
   if (webMessage && typeof webMessage === "object") {
     webMessage.sendReply = context.sendReply;
     webMessage.reply = context.reply;
@@ -500,7 +513,7 @@ function createCommandContext(socket, webMessage, text, commandName) {
 }
 
 /* ============================================================
-   EXECUÇÃO DE COMANDOS (SUPORTE COMPLETO A AMBOS OS ESTILOS)
+   EXECUÇÃO DE COMANDOS
 ============================================================ */
 async function executeCommand(socket, webMessage, text) {
   try {
@@ -521,7 +534,7 @@ async function executeCommand(socket, webMessage, text) {
     success(`Concluído: ${commandName}`);
     return true;
   } catch (err) {
-    error(`Erro no comando: ${err?.stack || err?.message || err}`);
+    error(`Erro isolado no comando (não derruba a conexão): ${err?.stack || err?.message || err}`);
     return true;
   }
 }
@@ -561,21 +574,18 @@ function purgeCorruptedSession() {
 }
 
 /* ============================================================
-   CONEXÃO COM A BAILEYS
+   CONEXÃO COM A BAILEYS (TRATAMENTO DE ERRO 440)
 ============================================================ */
 async function connect() {
   if (AUTO_RESTART.restarting) return null;
   if (activeSocket) {
-    warning("Instância de conexão já ativa.");
+    warning("Instância de conexão já ativa. Ignorando requisição de reconexão duplicada.");
     return activeSocket;
   }
 
   const { state, saveCreds } = await useMultiFileAuthState(BAILEYS_DIR);
-  
-  const version = [2, 3000, 1043857760];
 
   const socket = makeWASocket({
-    version,
     logger,
     printQRInTerminal: false,
     browser: ["Ubuntu", "Chrome", "125.0.0.0"],
@@ -640,13 +650,22 @@ async function connect() {
         try { activeReadline.close(); } catch {}
         activeReadline = null;
       }
+      
+      activeSocket = null;
       if (AUTO_RESTART.restarting) return;
-      if (activeSocket === socket) activeSocket = null;
       
       const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.statusCode;
       const reason = lastDisconnect?.error?.output?.payload?.error || "Desconhecido";
       
       warning(`Conexão fechada. Código Status: ${statusCode || "N/A"} (${reason})`);
+
+      // Tratamento para Erro 440 ou sessão substituída/duplicada
+      if (statusCode === 440) {
+        warning("Erro 440 (Sessão Conflitante). Aguardando estabilização para reconectar...");
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => connect(), 3000);
+        return;
+      }
 
       if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
         error("Sessão revogada ou inválida (Logged Out). Limpando sessão...");
@@ -656,7 +675,7 @@ async function connect() {
         return;
       }
       
-      warning("Reconectando em 5 segundos...");
+      warning("Reconectando em 3 segundos...");
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(async () => {
         reconnectTimer = null;
@@ -666,7 +685,7 @@ async function connect() {
         } catch (err) {
           error(`Erro ao reconectar: ${err?.message || err}`);
         }
-      }, 5000);
+      }, 3000);
     }
   });
 
